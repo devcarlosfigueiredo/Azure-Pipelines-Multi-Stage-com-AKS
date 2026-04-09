@@ -1,0 +1,173 @@
+# =============================================================================
+# CI Pipeline — Lint → Test → Build → Push ACR
+# Triggers: push to main, any PR targeting main
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - app/**
+      - tests/**
+      - Dockerfile
+      - requirements.txt
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - app/**
+      - tests/**
+      - Dockerfile
+      - requirements.txt
+
+# ── Variable groups (linked to Azure Key Vault) ───────────────────────────────
+variables:
+  - group: azdevops-demo-common        # ACR_LOGIN_SERVER, ACR_NAME, etc.
+  - name: IMAGE_NAME
+    value: myapp
+  - name: PYTHON_VERSION
+    value: "3.12"
+  - name: dockerfilePath
+    value: Dockerfile
+
+# ── Stages ────────────────────────────────────────────────────────────────────
+stages:
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: Validate
+  displayName: "🔍 Lint & Test"
+  jobs:
+    - job: LintAndTest
+      displayName: "Lint, Type-check & Pytest"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - template: templates/build-steps.yml
+          parameters:
+            pythonVersion: $(PYTHON_VERSION)
+            runTests: true
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: Build
+  displayName: "🐳 Build & Push"
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+    - job: DockerBuild
+      displayName: "Build Docker image & push to ACR"
+      pool:
+        vmImage: ubuntu-latest
+      variables:
+        IMAGE_TAG: $(Build.BuildId)
+        FULL_IMAGE: $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)
+      steps:
+
+        # ── Authenticate to ACR via Service Connection ──────────────────────
+        - task: AzureCLI@2
+          displayName: "ACR Login"
+          inputs:
+            azureSubscription: $(AZURE_SERVICE_CONNECTION)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az acr login --name $(ACR_NAME)
+
+        # ── Build image with build args injected by pipeline ────────────────
+        - task: Docker@2
+          displayName: "Build Docker image"
+          inputs:
+            command: build
+            dockerfile: $(dockerfilePath)
+            buildContext: .
+            repository: $(ACR_LOGIN_SERVER)/$(IMAGE_NAME)
+            tags: |
+              $(Build.BuildId)
+              latest
+            arguments: >
+              --build-arg APP_VERSION=$(Build.BuildId)
+              --build-arg BUILD_ID=$(Build.BuildId)
+              --build-arg BUILD_DATE=$(Build.RequestedForEmail)
+            addPipelineData: true
+
+        # ── Trivy vulnerability scan ─────────────────────────────────────────
+        - script: |
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:latest image \
+              --exit-code 0 \
+              --severity CRITICAL,HIGH \
+              --format table \
+              $(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)
+          displayName: "🔒 Trivy vulnerability scan"
+
+        # ── Push to ACR ──────────────────────────────────────────────────────
+        - task: Docker@2
+          displayName: "Push to ACR"
+          inputs:
+            command: push
+            repository: $(ACR_LOGIN_SERVER)/$(IMAGE_NAME)
+            tags: |
+              $(Build.BuildId)
+              latest
+
+        # ── Publish image tag as artifact for CD pipelines ──────────────────
+        - script: |
+            echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(Build.BuildId)"
+            echo "$(Build.BuildId)" > $(Build.ArtifactStagingDirectory)/image-tag.txt
+            echo "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)" >> $(Build.ArtifactStagingDirectory)/image-tag.txt
+          displayName: "Publish image tag artifact"
+          name: setImageTag
+
+        - task: PublishPipelineArtifact@1
+          displayName: "Upload image-tag artifact"
+          inputs:
+            targetPath: $(Build.ArtifactStagingDirectory)/image-tag.txt
+            artifact: image-tag
+            publishLocation: pipeline
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: ReleaseNotes
+  displayName: "📋 Release Notes"
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+    - job: GenerateReleaseNotes
+      displayName: "Generate Release Notes artifact"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - script: |
+            mkdir -p $(Build.ArtifactStagingDirectory)/release-notes
+            cat > $(Build.ArtifactStagingDirectory)/release-notes/RELEASE.md << EOF
+            # Release Notes — Build $(Build.BuildId)
+
+            ## Metadata
+            | Field         | Value                              |
+            |---------------|------------------------------------|
+            | Build ID      | $(Build.BuildId)                   |
+            | Branch        | $(Build.SourceBranchName)          |
+            | Commit        | $(Build.SourceVersion)             |
+            | Triggered by  | $(Build.RequestedFor)              |
+            | Date          | $(Build.BuildProcessParameters)    |
+            | Image         | $(ACR_LOGIN_SERVER)/myapp:$(Build.BuildId) |
+
+            ## Commits in this build
+            $(git log --oneline -20 2>/dev/null || echo "Git history not available")
+
+            ## Deployment targets
+            - **Staging**: Auto-deploy after CI passes
+            - **Production**: Manual approval required
+            EOF
+          displayName: "Generate RELEASE.md"
+
+        - task: PublishPipelineArtifact@1
+          displayName: "Publish release notes"
+          inputs:
+            targetPath: $(Build.ArtifactStagingDirectory)/release-notes
+            artifact: release-notes
+            publishLocation: pipeline

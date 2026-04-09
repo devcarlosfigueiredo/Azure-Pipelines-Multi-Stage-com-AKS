@@ -1,0 +1,289 @@
+# =============================================================================
+# CD Pipeline — Production
+# Requires MANUAL APPROVAL before deploy
+# Flow: Approval Gate → Deploy → Health Validation → Rollback if failed
+# =============================================================================
+
+trigger: none
+
+resources:
+  pipelines:
+    - pipeline: staging_cd
+      source: azure-devops-demo-cd-staging
+      trigger:
+        stages:
+          - StagingValidation              # Only promote after staging is validated
+
+variables:
+  - group: azdevops-demo-common
+  - group: azdevops-demo-production        # PROD_NAMESPACE, INGRESS_HOST, etc.
+  - name: ENVIRONMENT
+    value: production
+  - name: HELM_RELEASE
+    value: myapp-prod
+  - name: K8S_NAMESPACE
+    value: myapp-production
+  - name: HELM_VALUES_FILE
+    value: helm/myapp/values-prod.yaml
+  - name: HEALTH_CHECK_RETRIES
+    value: 10
+  - name: HEALTH_CHECK_DELAY
+    value: 15
+
+stages:
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 1 — Pre-flight checks (run BEFORE approval gate)
+# ────────────────────────────────────────────────────────────────────────────
+- stage: PreFlight
+  displayName: "🔍 Pre-flight Checks"
+  jobs:
+    - job: PreFlight
+      displayName: "Verify staging image and cluster state"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - task: DownloadPipelineArtifact@2
+          displayName: "Download image-tag artifact"
+          inputs:
+            source: specific
+            pipeline: $(resources.pipeline.staging_cd.pipelineID)
+            runVersion: latest
+            artifact: image-tag
+            path: $(Pipeline.Workspace)/image-tag
+
+        - script: |
+            IMAGE_TAG=$(cat $(Pipeline.Workspace)/image-tag/image-tag.txt | head -1)
+            echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$IMAGE_TAG"
+            echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+            echo "Promoting image: $IMAGE_TAG to Production"
+          displayName: "Validate image tag"
+          name: readImageTag
+
+        - task: AzureCLI@2
+          displayName: "Verify ACR image exists"
+          inputs:
+            azureSubscription: $(AZURE_SERVICE_CONNECTION)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              IMAGE_TAG=$(cat $(Pipeline.Workspace)/image-tag/image-tag.txt | head -1)
+              echo "Verifying image: $(ACR_LOGIN_SERVER)/myapp:$IMAGE_TAG"
+              az acr repository show-tags \
+                --name $(ACR_NAME) \
+                --repository myapp \
+                --query "contains(@, '$IMAGE_TAG')" \
+                --output tsv | grep -q "true" || {
+                  echo "❌ Image tag $IMAGE_TAG not found in ACR!"
+                  exit 1
+                }
+              echo "✅ Image verified in ACR"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 2 — Manual Approval Gate
+# Configure approvers in Azure DevOps → Environments → production → Approvals
+# ────────────────────────────────────────────────────────────────────────────
+- stage: ApprovalGate
+  displayName: "🔐 Manual Approval Required"
+  dependsOn: PreFlight
+  jobs:
+    - deployment: WaitForApproval
+      displayName: "Awaiting approval to deploy to Production"
+      environment: production               # ← Approval configured HERE in Azure DevOps UI
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - script: |
+                  echo "✅ Production deployment approved!"
+                  echo "Approver: $(Build.RequestedFor)"
+                  echo "Timestamp: $(date -u)"
+                displayName: "Approval received"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 3 — Deploy to Production
+# ────────────────────────────────────────────────────────────────────────────
+- stage: DeployProduction
+  displayName: "🚀 Deploy → Production"
+  dependsOn:
+    - PreFlight
+    - ApprovalGate
+  variables:
+    IMAGE_TAG: $[ stageDependencies.PreFlight.PreFlight.outputs['readImageTag.IMAGE_TAG'] ]
+  jobs:
+    - deployment: DeployToProd
+      displayName: "Helm upgrade — Production"
+      environment: production
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureCLI@2
+                displayName: "Get AKS credentials"
+                inputs:
+                  azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az aks get-credentials \
+                      --resource-group $(AKS_RESOURCE_GROUP) \
+                      --name $(AKS_CLUSTER_NAME) \
+                      --overwrite-existing
+
+              # ── Record current revision before deploy (for rollback) ─────
+              - script: |
+                  CURRENT_REV=$(helm history $(HELM_RELEASE) -n $(K8S_NAMESPACE) --max 1 -o json 2>/dev/null \
+                    | python3 -c "import sys,json; h=json.load(sys.stdin); print(h[0]['revision'])" 2>/dev/null || echo "0")
+                  echo "##vso[task.setvariable variable=PREVIOUS_REVISION]$CURRENT_REV"
+                  echo "Previous Helm revision: $CURRENT_REV"
+                displayName: "Record current Helm revision"
+
+              # ── Helm upgrade ─────────────────────────────────────────────
+              - template: templates/deploy-steps.yml
+                parameters:
+                  helmRelease: $(HELM_RELEASE)
+                  namespace: $(K8S_NAMESPACE)
+                  valuesFile: $(HELM_VALUES_FILE)
+                  imageTag: $(IMAGE_TAG)
+                  acrLoginServer: $(ACR_LOGIN_SERVER)
+                  environment: $(ENVIRONMENT)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 4 — Post-deploy Health Validation + Auto-Rollback
+# ────────────────────────────────────────────────────────────────────────────
+- stage: HealthValidation
+  displayName: "🏥 Health Validation"
+  dependsOn: DeployProduction
+  variables:
+    IMAGE_TAG: $[ stageDependencies.PreFlight.PreFlight.outputs['readImageTag.IMAGE_TAG'] ]
+  jobs:
+    - job: HealthCheck
+      displayName: "Post-deploy health checks"
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - task: AzureCLI@2
+          displayName: "Get AKS credentials"
+          inputs:
+            azureSubscription: $(AZURE_SERVICE_CONNECTION)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az aks get-credentials \
+                --resource-group $(AKS_RESOURCE_GROUP) \
+                --name $(AKS_CLUSTER_NAME) \
+                --overwrite-existing
+
+        - script: |
+            set -e
+            PROD_URL="https://$(PROD_INGRESS_HOST)"
+            RETRIES=$(HEALTH_CHECK_RETRIES)
+            DELAY=$(HEALTH_CHECK_DELAY)
+            SUCCESS=false
+
+            echo "Health checking $PROD_URL (${RETRIES} retries, ${DELAY}s delay)..."
+
+            for i in $(seq 1 $RETRIES); do
+              STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$PROD_URL/health" 2>/dev/null || echo "000")
+              echo "Attempt $i/$RETRIES → HTTP $STATUS"
+
+              if [ "$STATUS" = "200" ]; then
+                BODY=$(curl -sf "$PROD_URL/health")
+                echo "Response: $BODY"
+                HEALTH_STATUS=$(echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])")
+                if [ "$HEALTH_STATUS" = "healthy" ]; then
+                  SUCCESS=true
+                  break
+                fi
+              fi
+              sleep $DELAY
+            done
+
+            if [ "$SUCCESS" = "true" ]; then
+              echo "##vso[task.setvariable variable=HEALTH_PASSED]true"
+              echo "✅ Health check passed!"
+            else
+              echo "##vso[task.setvariable variable=HEALTH_PASSED]false"
+              echo "❌ Health check FAILED after $RETRIES attempts"
+              exit 1
+            fi
+          displayName: "HTTP health check with retry"
+
+        - script: |
+            echo "Checking deployment rollout status..."
+            kubectl rollout status deployment/$(HELM_RELEASE)-myapp \
+              -n $(K8S_NAMESPACE) \
+              --timeout=300s
+            echo "✅ Rollout complete"
+          displayName: "Kubernetes rollout status"
+
+    # ── Auto-rollback job (runs ONLY if HealthCheck fails) ────────────────
+    - job: AutoRollback
+      displayName: "🔄 Auto-Rollback"
+      dependsOn: HealthCheck
+      condition: failed()
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - task: AzureCLI@2
+          displayName: "Get AKS credentials for rollback"
+          inputs:
+            azureSubscription: $(AZURE_SERVICE_CONNECTION)
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              az aks get-credentials \
+                --resource-group $(AKS_RESOURCE_GROUP) \
+                --name $(AKS_CLUSTER_NAME) \
+                --overwrite-existing
+
+        - script: |
+            set -e
+            echo "⚠️  Health check failed! Initiating automatic rollback..."
+
+            # Helm rollback to previous revision
+            helm rollback $(HELM_RELEASE) 0 \
+              --namespace $(K8S_NAMESPACE) \
+              --wait \
+              --timeout 300s
+
+            echo "✅ Rollback completed. Verifying previous version..."
+            kubectl rollout status deployment/$(HELM_RELEASE)-myapp \
+              -n $(K8S_NAMESPACE) \
+              --timeout=120s
+
+            echo "✅ Rollback successful. Production restored to previous version."
+
+            # Fail the pipeline to alert the team
+            echo "##vso[task.logissue type=error]Production deploy failed and was rolled back automatically."
+            exit 1
+          displayName: "Execute Helm rollback"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Stage 5 — Production Deployment Summary
+# ────────────────────────────────────────────────────────────────────────────
+- stage: DeploymentSummary
+  displayName: "📊 Deployment Summary"
+  dependsOn: HealthValidation
+  condition: succeeded()
+  jobs:
+    - job: Summary
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - script: |
+            echo "## ✅ Production Deployment Successful"
+            echo ""
+            echo "| Field         | Value                          |"
+            echo "|---------------|--------------------------------|"
+            echo "| Image Tag     | $(IMAGE_TAG)                   |"
+            echo "| Environment   | Production                     |"
+            echo "| Namespace     | $(K8S_NAMESPACE)               |"
+            echo "| Helm Release  | $(HELM_RELEASE)                |"
+            echo "| Deployed by   | $(Build.RequestedFor)          |"
+            echo "| URL           | https://$(PROD_INGRESS_HOST)   |"
+          displayName: "Deployment summary"

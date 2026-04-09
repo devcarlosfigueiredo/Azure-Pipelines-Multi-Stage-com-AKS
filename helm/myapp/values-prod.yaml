@@ -1,0 +1,42 @@
+# =============================================================================
+# Helm Values — Production overrides
+# =============================================================================
+
+replicaCount: 3
+
+env:
+  ENVIRONMENT: production
+
+ingress:
+  hosts:
+    - host: myapp.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: myapp-prod-tls
+      hosts:
+        - myapp.example.com
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+
+keyVault:
+  vaultName: "kv-azdevops-demo-production"
+  tenantId: "YOUR_TENANT_ID"
+
+# PodDisruptionBudget ensures HA during rolling updates
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2

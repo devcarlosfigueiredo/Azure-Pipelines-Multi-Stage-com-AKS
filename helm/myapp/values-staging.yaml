@@ -1,0 +1,34 @@
+# =============================================================================
+# Helm Values — Staging overrides
+# =============================================================================
+
+replicaCount: 1
+
+env:
+  ENVIRONMENT: staging
+
+ingress:
+  hosts:
+    - host: myapp-staging.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: myapp-staging-tls
+      hosts:
+        - myapp-staging.example.com
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+autoscaling:
+  enabled: false   # Fixed replicas in staging
+
+keyVault:
+  vaultName: "kv-azdevops-demo-staging"
+  tenantId: "YOUR_TENANT_ID"

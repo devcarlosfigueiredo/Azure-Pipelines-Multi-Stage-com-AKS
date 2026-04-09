@@ -1,0 +1,173 @@
+# =============================================================================
+# CD Pipeline — Staging
+# Triggered automatically when CI succeeds on main
+# Flow: Deploy → Smoke Tests → Health Validation
+# =============================================================================
+
+trigger: none   # CD is triggered by CI completion resource below
+
+resources:
+  pipelines:
+    - pipeline: ci                              # Reference to CI pipeline
+      source: azure-devops-demo-ci
+      trigger:
+        branches:
+          include:
+            - main
+
+variables:
+  - group: azdevops-demo-common
+  - group: azdevops-demo-staging               # STAGING_NAMESPACE, INGRESS_HOST, etc.
+  - name: ENVIRONMENT
+    value: staging
+  - name: HELM_RELEASE
+    value: myapp-staging
+  - name: K8S_NAMESPACE
+    value: myapp-staging
+  - name: HELM_VALUES_FILE
+    value: helm/myapp/values-staging.yaml
+
+stages:
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: DeployStaging
+  displayName: "🚀 Deploy → Staging"
+  jobs:
+    - deployment: DeployToStaging
+      displayName: "Helm upgrade — Staging"
+      environment: staging                      # Azure DevOps Environment (gates)
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              # ── Download image tag from CI artifact ─────────────────────
+              - task: DownloadPipelineArtifact@2
+                displayName: "Download image-tag artifact"
+                inputs:
+                  source: specific
+                  pipeline: $(resources.pipeline.ci.pipelineID)
+                  runVersion: latest
+                  artifact: image-tag
+                  path: $(Pipeline.Workspace)/image-tag
+
+              - script: |
+                  IMAGE_TAG=$(cat $(Pipeline.Workspace)/image-tag/image-tag.txt | head -1)
+                  echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+                  echo "Deploying image tag: $IMAGE_TAG"
+                displayName: "Read image tag"
+
+              # ── Get AKS credentials ─────────────────────────────────────
+              - task: AzureCLI@2
+                displayName: "Get AKS credentials"
+                inputs:
+                  azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az aks get-credentials \
+                      --resource-group $(AKS_RESOURCE_GROUP) \
+                      --name $(AKS_CLUSTER_NAME) \
+                      --overwrite-existing
+
+              # ── Ensure namespace exists ─────────────────────────────────
+              - script: |
+                  kubectl create namespace $(K8S_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+                displayName: "Ensure namespace exists"
+
+              # ── Helm upgrade (or install) ───────────────────────────────
+              - template: templates/deploy-steps.yml
+                parameters:
+                  helmRelease: $(HELM_RELEASE)
+                  namespace: $(K8S_NAMESPACE)
+                  valuesFile: $(HELM_VALUES_FILE)
+                  imageTag: $(IMAGE_TAG)
+                  acrLoginServer: $(ACR_LOGIN_SERVER)
+                  environment: $(ENVIRONMENT)
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: SmokeTests
+  displayName: "🧪 Smoke Tests"
+  dependsOn: DeployStaging
+  jobs:
+    - job: SmokeTest
+      displayName: "Run smoke tests against Staging"
+      pool:
+        vmImage: ubuntu-latest
+      variables:
+        STAGING_URL: "https://$(STAGING_INGRESS_HOST)"
+      steps:
+        - script: |
+            set -e
+            BASE_URL="$(STAGING_URL)"
+            echo "Running smoke tests against: $BASE_URL"
+
+            check_endpoint() {
+              local path=$1
+              local expected_status=$2
+              local response
+              response=$(curl -sf -o /dev/null -w "%{http_code}" "$BASE_URL$path" 2>/dev/null || echo "000")
+              if [ "$response" != "$expected_status" ]; then
+                echo "❌ FAIL: $path returned HTTP $response (expected $expected_status)"
+                return 1
+              fi
+              echo "✅ PASS: $path → HTTP $response"
+            }
+
+            check_endpoint "/" 200
+            check_endpoint "/health" 200
+            check_endpoint "/ready" 200
+            check_endpoint "/info" 200
+            check_endpoint "/metrics" 200
+            check_endpoint "/nonexistent" 404
+
+            # Validate health response body
+            HEALTH_BODY=$(curl -sf "$BASE_URL/health")
+            echo "$HEALTH_BODY" | python3 -c "
+            import sys, json
+            data = json.load(sys.stdin)
+            assert data['status'] == 'healthy', f'Expected healthy, got {data[\"status\"]}'
+            print('✅ Health response body valid')
+            "
+
+            echo ""
+            echo "✅ All smoke tests passed!"
+          displayName: "HTTP smoke tests"
+
+        - script: |
+            set -e
+            BASE_URL="$(STAGING_URL)"
+
+            echo "Checking pod readiness in namespace $(K8S_NAMESPACE)..."
+            kubectl wait deployment/myapp-staging-myapp \
+              --namespace=$(K8S_NAMESPACE) \
+              --for=condition=Available \
+              --timeout=120s
+
+            READY=$(kubectl get deployment myapp-staging-myapp \
+              -n $(K8S_NAMESPACE) \
+              -o jsonpath='{.status.readyReplicas}')
+            echo "✅ Ready replicas: $READY"
+          displayName: "Kubernetes readiness check"
+
+# ────────────────────────────────────────────────────────────────────────────
+- stage: StagingValidation
+  displayName: "✅ Staging Validation Report"
+  dependsOn: SmokeTests
+  jobs:
+    - job: ValidationReport
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - script: |
+            echo "## Staging Validation Summary"
+            echo "| Check          | Status |"
+            echo "|----------------|--------|"
+            echo "| Deploy         | ✅     |"
+            echo "| Smoke Tests    | ✅     |"
+            echo "| K8s Readiness  | ✅     |"
+            echo ""
+            echo "Staging environment is healthy and ready."
+            echo "Proceed to Production deployment when ready."
+          displayName: "Print validation report"

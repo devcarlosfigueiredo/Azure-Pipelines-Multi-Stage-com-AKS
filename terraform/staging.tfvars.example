@@ -1,0 +1,37 @@
+# terraform/staging.tfvars
+# Example variable values for staging environment
+# Copy and adjust — never commit real secrets here
+
+project_name = "azdevops-demo"
+environment  = "staging"
+location     = "West Europe"
+owner        = "platform-engineering"
+cost_center  = "engineering"
+
+# ACR
+acr_sku                      = "Premium"
+acr_geo_replication_location = "North Europe"
+acr_retention_days           = 7
+
+# AKS
+kubernetes_version = "1.30"
+aks_admin_group_object_ids = [
+  "00000000-0000-0000-0000-000000000000"  # Replace with your AAD group ID
+]
+
+# System pool
+system_node_count     = 1
+system_node_vm_size   = "Standard_D2s_v3"
+system_node_max_count = 3
+
+# App pool
+app_node_vm_size   = "Standard_D2s_v3"
+app_node_count     = 1
+app_node_min_count = 1
+app_node_max_count = 5
+
+# Monitoring
+log_retention_days = 30
+
+# Key Vault (add your pipeline agent IPs)
+key_vault_allowed_ips = []

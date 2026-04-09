@@ -1,0 +1,82 @@
+# =============================================================================
+# Template: deploy-steps.yml
+# Reusable Helm deploy steps — used by staging and production CD pipelines
+# =============================================================================
+
+parameters:
+  - name: helmRelease
+    type: string
+  - name: namespace
+    type: string
+  - name: valuesFile
+    type: string
+  - name: imageTag
+    type: string
+  - name: acrLoginServer
+    type: string
+  - name: environment
+    type: string
+    default: staging
+  - name: helmTimeout
+    type: string
+    default: "10m0s"
+  - name: helmChartPath
+    type: string
+    default: helm/myapp
+
+steps:
+
+  # ── Install Helm ─────────────────────────────────────────────────────────────
+  - task: HelmInstaller@1
+    displayName: "Install Helm"
+    inputs:
+      helmVersionToInstall: latest
+
+  # ── Add any required Helm repos ───────────────────────────────────────────────
+  - script: |
+      helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      helm repo update
+    displayName: "Update Helm repos"
+
+  # ── Dry-run first to catch errors early ──────────────────────────────────────
+  - script: |
+      echo "Running Helm dry-run for ${{ parameters.helmRelease }}..."
+      helm upgrade ${{ parameters.helmRelease }} ${{ parameters.helmChartPath }} \
+        --install \
+        --dry-run \
+        --namespace ${{ parameters.namespace }} \
+        --create-namespace \
+        --values ${{ parameters.valuesFile }} \
+        --set image.repository=${{ parameters.acrLoginServer }}/myapp \
+        --set image.tag=${{ parameters.imageTag }} \
+        --set env.BUILD_ID=${{ parameters.imageTag }} \
+        --timeout ${{ parameters.helmTimeout }}
+      echo "✅ Dry-run successful"
+    displayName: "Helm dry-run"
+
+  # ── Apply deploy ──────────────────────────────────────────────────────────────
+  - script: |
+      echo "Deploying ${{ parameters.helmRelease }} to ${{ parameters.namespace }}..."
+      helm upgrade ${{ parameters.helmRelease }} ${{ parameters.helmChartPath }} \
+        --install \
+        --atomic \
+        --cleanup-on-fail \
+        --namespace ${{ parameters.namespace }} \
+        --create-namespace \
+        --values ${{ parameters.valuesFile }} \
+        --set image.repository=${{ parameters.acrLoginServer }}/myapp \
+        --set image.tag=${{ parameters.imageTag }} \
+        --set env.BUILD_ID=${{ parameters.imageTag }} \
+        --timeout ${{ parameters.helmTimeout }} \
+        --history-max 10
+      echo "✅ Helm deploy complete"
+    displayName: "Helm upgrade (install)"
+
+  # ── Print release status ──────────────────────────────────────────────────────
+  - script: |
+      echo "=== Helm Release Status ==="
+      helm status ${{ parameters.helmRelease }} -n ${{ parameters.namespace }}
+      echo ""
+      echo "=== Pod Status ==="
+      kubectl get pods -n ${{ parameters.namespace }} -l app.kubernetes.io/instance=${{ parameters.helmRelease }}
+    displayName: "Helm release status"
